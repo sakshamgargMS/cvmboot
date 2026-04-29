@@ -707,6 +707,14 @@ static void _install_sharedir_file(
 
     makepath2(&src, sharedir(), src_suffix);
     makepath2(&dest, mntdir(), dest_suffix);
+
+    /* Ensure the parent directory exists */
+    {
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", dest.buf);
+        execf(&buf, "mkdir -p %s", dirname(tmp));
+    }
+
     execf(&buf, "cp %s %s", src.buf, dest.buf);
 
     if (chmod(dest.buf, 0755) < 0)
@@ -915,7 +923,7 @@ static void _add_user(const char* disk, const user_opt_t* user)
     makepath3(&homedir, mntdir(), "/home", user->username);
 
     /* if password filename is non-empty, then load the password */
-    if (user->password && *user->password)
+    if (*user->password)
     {
         size_t size = 0;
 
@@ -4080,7 +4088,7 @@ static int _subcommand_azcopy(int argc, const char* argv[])
     {
         char cmd[3*PATH_MAX];
 
-        snprintf(cmd, sizeof(cmd), "%s copy \"%s\" %s/%s",
+        snprintf(cmd, sizeof(cmd), "%s copy \"%s\" %s/%s --from-to BlobLocal",
             azcopy, url, mntdir, bn);
 
         if (system(cmd) != 0)

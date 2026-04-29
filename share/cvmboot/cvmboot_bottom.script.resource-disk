@@ -55,19 +55,35 @@ cvmboot_panic()
 ##==============================================================================
 create_rootfs_rw()
 {
-    local disk="/dev/sdb"
+    # Find the OS disk by looking for our thin-data partition type GUID.
+    # This GUID is unique to cvmboot-prepared disks.
+    local thin_data_guid="136CE4AF-AFED-4F96-84FF-0651088074EE"
+    local os_disk=""
+    for candidate in /dev/sd?; do
+        if [ -b "${candidate}" ]; then
+            if fdisk -l -o DEVICE,Type-UUID "${candidate}" 2>/dev/null | grep -qi "${thin_data_guid}"; then
+                os_disk="${candidate}"
+                break
+            fi
+        fi
+    done
+
+    # The resource disk is whichever /dev/sd? is NOT the OS disk.
+    local disk=""
+    for candidate in /dev/sd?; do
+        if [ -b "${candidate}" ] && [ "${candidate}" != "${os_disk}" ]; then
+            disk="${candidate}"
+            break
+        fi
+    done
+
+    if [ -z "${disk}" ] || [ ! -b "${disk}" ]; then
+        cvmboot_panic "${script}: resource disk not found (os_disk=${os_disk})"
+    fi
+
     local partition="${disk}1"
 
-    # ATTN: check for whether it is has ephemeral readme
-
-    #fdisk -l "${disk}"
-    #read
-    #echo "<<<<<<<< PRESS ANY KEY TO CONTINUE >>>>>>>>"
-
-    # Fail if the resource disk does not exist
-    if [ ! -b "${disk}" ]; then
-        cvmboot_panic "${script}: disk not found: ${disk}"
-    fi
+    echo "${script}: os_disk=${os_disk} resource_disk=${disk}"
 
     # Remove partition if it exists
     if [ -b "${partition}" ]; then
@@ -156,11 +172,15 @@ create_rootfs_rw()
         cvmboot_panic "${script}: failed to create ${keyfile}"
     fi
 
+    echo "${script}: loop=${loop} offset=${offset} size=${size} sectors=${sectors} start=${start} sectsize=${sectsize}"
+
     # open the crypto device:
     cryptsetup open --type plain "${loop}" "${rootfs_rw}" --batch-mode --cipher=aes-xts-plain64 --key-size=${keysize} --key-file=${keyfile} --perf-no_write_workqueue
     if  [ "$?" != "0" ]; then
         cvmboot_panic "${script}: cannot open dm-crypt device: ${rootfs_rw}"
     fi
+
+    echo "${script}: rootfs_rw blockdev=$(blockdev --getsz /dev/mapper/${rootfs_rw})"
 
     #echo "<<<<<<<< PRESS ANY KEY TO CONTINUE >>>>>>>>"
     #read
@@ -192,7 +212,15 @@ create_rootfs()
 {
     local origin=/dev/mapper/${rootfs_ro}
     local cowdev=/dev/mapper/${rootfs_rw}
-    local sectors=$(blockdev --getsz ${origin})
+
+    # Get the origin device size from its dm table (more reliable than blockdev
+    # in initramfs where devmapper nodes may report unexpected sizes).
+    local sectors=$(dmsetup table ${rootfs_ro} | awk '{print $2}')
+
+    echo "${script}: origin=${origin} cowdev=${cowdev} sectors=${sectors}"
+    echo "${script}: blockdev origin=$(blockdev --getsz ${origin}) cow=$(blockdev --getsz ${cowdev})"
+    echo "${script}: dmsetup table ${rootfs_ro}: $(dmsetup table ${rootfs_ro})"
+
     dmsetup create ${rootfs} --table "0 ${sectors} snapshot ${origin} ${cowdev} N 8"
     if [ "$?" != "0" ]; then
         echo "${script}: cannot create snapshot: ${rootfs_ro}/${rootfs_rw}"
