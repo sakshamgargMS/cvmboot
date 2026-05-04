@@ -363,6 +363,32 @@ static void _patch_fstab(const char* disk)
     buf_release(&buf);
 }
 
+/* Comment out the root (/) entry in fstab when using overlayfs, so that
+ * systemd-remount-fs does not try to remount / as ext4. */
+static void _patch_fstab_for_overlayfs(const char* disk)
+{
+    buf_t buf = BUF_INITIALIZER;
+    path_t fstabfile;
+
+    printf("%s>>> Patching fstab for overlayfs root...%s\n",
+        colors_green, colors_reset);
+
+    mount_disk(disk, 0);
+
+    makepath2(&fstabfile, mntdir(), "etc/fstab");
+    if (access(fstabfile.buf, F_OK) < 0)
+        ERR("fstab file not found: %s", fstabfile.buf);
+
+    printf("Commenting out root entry in %s:%s...\n",
+        globals.disk, strip_mntdir(fstabfile.buf));
+    execf(&buf, "sed -i '/^[^#].*[[:space:]]\\/[[:space:]]/s/^/#/' %s",
+        fstabfile.buf);
+
+    umount_disk();
+
+    buf_release(&buf);
+}
+
 // Prevent the ephemeral resource disk (/dev/sdb) from being reformatted.
 void _preserve_resource_disk(const char* disk)
 {
@@ -3207,7 +3233,10 @@ static void _prepare_disk(
 
     // Disable Azure resource-disk formatting and mounting on /mnt:
     if (use_resource_disk)
+    {
         _preserve_resource_disk(disk);
+        _patch_fstab_for_overlayfs(disk);
+    }
 
     // Update resolv.conf so apt commands will work below:
     if (!skip_resolv_conf)

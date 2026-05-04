@@ -25,7 +25,6 @@ script="root_ro script:"
 #rootfs=rootfs
 rootfs_ro=rootfs_verity
 rootfs_rw=rootfs_crypt
-rootfs=rootfs_snapshot
 
 ##==============================================================================
 ##
@@ -190,69 +189,59 @@ create_rootfs_rw
 
 ##==============================================================================
 ##
-## create_rootfs()
-##
-## Create the dm-snapshot called /dev/mapper/${rootfs} from these devices:
-##     /dev/mapper/${rootfs_ro}
-##     /dev/mapper/${rootfs_rw}
+## Set up overlayfs root using:
+##     lower = /dev/mapper/${rootfs_ro} (verity-protected, read-only)
+##     upper = /dev/mapper/${rootfs_rw} (dm-crypt on resource disk, read-write)
 ##
 ## Resulting topology:
 ##
-##                      [ /dev/mapper/${rootfs} ]
-##                      [ dm-snapshot driver    ]
-##                      /                       \
-##      *[ /dev/mapper/${rootfs_ro} ]      *[ /dev/mapper/${rootfs_rw} ]
-##       [ dm-verity driver         ]       [ dm-crypt driver          ]
-##            /           \                 [ /dev/sda? raw disk       ]
-##           /             \
-## [ /dev/sda? (ext4) ] [ /dev/sda? (verity) ]
-##
-##==============================================================================
-create_rootfs()
-{
-    local origin=/dev/mapper/${rootfs_ro}
-    local cowdev=/dev/mapper/${rootfs_rw}
-
-    # Get the origin device size from its dm table (more reliable than blockdev
-    # in initramfs where devmapper nodes may report unexpected sizes).
-    local sectors=$(dmsetup table ${rootfs_ro} | awk '{print $2}')
-
-    echo "${script}: origin=${origin} cowdev=${cowdev} sectors=${sectors}"
-    echo "${script}: blockdev origin=$(blockdev --getsz ${origin}) cow=$(blockdev --getsz ${cowdev})"
-    echo "${script}: dmsetup table ${rootfs_ro}: $(dmsetup table ${rootfs_ro})"
-
-    dmsetup create ${rootfs} --table "0 ${sectors} snapshot ${origin} ${cowdev} N 8"
-    if [ "$?" != "0" ]; then
-        echo "${script}: cannot create snapshot: ${rootfs_ro}/${rootfs_rw}"
-        lsblk
-        read
-        exit 0
-    fi
-}
-
-##==============================================================================
-##
-## Unmount ${rootmnt}, create the snapshot, and mount the snapshot on ${rootmnt}
+##                      [ overlayfs on ${rootmnt} ]
+##                      /                         \
+##      [ /run/cvmboot/lower (ro) ]    [ /run/cvmboot/upper (rw) ]
+##      [ /dev/mapper/${rootfs_ro}]    [ /dev/mapper/${rootfs_rw}]
+##      [ dm-verity driver        ]    [ dm-crypt driver         ]
+##           /           \             [ loop on resource disk   ]
+##          /             \
+## [ thin volume (ext4) ] [ hash partition ]
 ##
 ##==============================================================================
 
-# Unmount the integrity-protected read-only root file system.
-umount ${rootmnt}/lib/modules
-
-# ATTN: the following umount fails on Azure Ubuntu image
-umount ${rootmnt}
-#if [ "$?" != "0" ]; then
-#    cvmboot_panic "umount of ${rootmnt} failed"
-#    exit 0
-#fi
-
-# Create the rootfs snapshot:
-create_rootfs
-
-# Mount the snapshot on ${rootmnt}
-mount "/dev/mapper/${rootfs}" "${rootmnt}"
+# Format the crypt device as ext4 for the overlayfs upper layer
+echo "${script}: formatting /dev/mapper/${rootfs_rw} as ext4"
+mkfs.ext4 -q /dev/mapper/${rootfs_rw}
 if [ "$?" != "0" ]; then
-    echo "${script}: mount failed: /dev/mapper/${rootfs} => ${rootmnt}"
-    read
-    exit 0
+    cvmboot_panic "${script}: failed to format /dev/mapper/${rootfs_rw} as ext4"
 fi
+
+# Move the verity-protected root mount to /run/cvmboot/lower.
+# Using /run/ ensures mounts survive switch_root.
+mkdir -p /run/cvmboot/lower
+mount -n -o move ${rootmnt} /run/cvmboot/lower
+if [ "$?" != "0" ]; then
+    cvmboot_panic "${script}: failed to move ${rootmnt} to /run/cvmboot/lower"
+fi
+
+# Mount the upper layer (encrypted resource disk)
+mkdir -p /run/cvmboot/upper
+mount /dev/mapper/${rootfs_rw} /run/cvmboot/upper
+if [ "$?" != "0" ]; then
+    cvmboot_panic "${script}: failed to mount /dev/mapper/${rootfs_rw}"
+fi
+mkdir -p /run/cvmboot/upper/upper /run/cvmboot/upper/work
+
+# Load the overlay module explicitly
+modprobe overlay 2>/dev/null
+
+# Mount overlayfs as the new root
+echo "${script}: mounting overlayfs on ${rootmnt}"
+mount -t overlay overlay \
+    -o lowerdir=/run/cvmboot/lower,upperdir=/run/cvmboot/upper/upper,workdir=/run/cvmboot/upper/work \
+    ${rootmnt}
+if [ "$?" != "0" ]; then
+    cvmboot_panic "${script}: failed to mount overlayfs on ${rootmnt}"
+fi
+
+# Ensure correct permissions on the new root
+chmod 755 "${rootmnt}"
+
+echo "${script}: overlayfs mounted successfully"
